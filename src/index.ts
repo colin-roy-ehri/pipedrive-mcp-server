@@ -269,13 +269,15 @@ const notesApi = withRateLimit(new pipedrive.NotesApi(apiClient));
 // @ts-ignore - UsersApi exists but may not be in type definitions
 const usersApi = withRateLimit(new pipedrive.UsersApi(apiClient));
 
-// Create MCP server
-const server = new McpServer({
-  name: "pipedrive-mcp-server",
-  version: "1.0.2"
-});
+// === SERVER FACTORY ===
 
-// === TOOLS ===
+function createServer(): McpServer {
+  const server = new McpServer({
+    name: "pipedrive-mcp-server",
+    version: "1.0.2"
+  });
+
+  // === TOOLS ===
 
 // Get all users (for finding owner IDs)
 server.tool(
@@ -1097,6 +1099,9 @@ server.prompt(
   })
 );
 
+  return server;
+}
+
 // Get transport type from environment variable (default to stdio)
 const transportType = process.env.MCP_TRANSPORT || 'stdio';
 
@@ -1133,6 +1138,7 @@ if (transportType === 'sse') {
 
       // Establish SSE connection
       console.error('New SSE connection request');
+      const sseServer = createServer();
       const transport = new SSEServerTransport(endpoint, res);
 
       // Store transport by session ID
@@ -1141,14 +1147,16 @@ if (transportType === 'sse') {
       transport.onclose = () => {
         console.error(`SSE connection closed: ${transport.sessionId}`);
         transports.delete(transport.sessionId);
+        sseServer.close();
       };
 
       try {
-        await server.connect(transport);
+        await sseServer.connect(transport);
         console.error(`SSE connection established: ${transport.sessionId}`);
       } catch (err) {
         console.error('Failed to establish SSE connection:', err);
         transports.delete(transport.sessionId);
+        sseServer.close();
       }
     } else if (req.method === 'POST' && url.pathname === endpoint) {
       const authResult = await verifyRequestAuthentication(req);
@@ -1220,13 +1228,6 @@ if (transportType === 'sse') {
   // Streamable HTTP transport — required by Gemini Enterprise and modern MCP clients
   const port = parseInt(process.env.PORT || process.env.MCP_PORT || '3000', 10);
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // stateless — works across Cloud Run instances
-    enableDnsRebindingProtection: false,
-  });
-
-  await server.connect(transport);
-
   const httpServer = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -1271,8 +1272,25 @@ if (transportType === 'sse') {
 
       try {
         console.error(`[MCP] Handling ${req.method} request to ${req.url}`);
-        await transport.handleRequest(req, res, body);
-        console.error(`[MCP] Request completed successfully`);
+        if (body) {
+          console.error(`[MCP] Request body:`, JSON.stringify(body).substring(0, 300));
+        }
+
+        // Create fresh server and transport per request (stateless mode requirement)
+        const reqServer = createServer();
+        const reqTransport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined, // stateless — one request per instance
+          enableDnsRebindingProtection: false,
+        });
+
+        await reqServer.connect(reqTransport);
+        await reqTransport.handleRequest(req, res, body);
+
+        // Clean up after response is sent
+        res.on('finish', () => {
+          reqTransport.close();
+          reqServer.close();
+        });
       } catch (err) {
         console.error('[MCP] Error handling MCP request:', {
           message: err instanceof Error ? err.message : String(err),
@@ -1304,6 +1322,7 @@ if (transportType === 'sse') {
   });
 } else {
   // Default: stdio transport
+  const server = createServer();
   const transport = new StdioServerTransport();
   server.connect(transport).catch(err => {
     console.error("Failed to start MCP server:", err);
