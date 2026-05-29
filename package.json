@@ -5,14 +5,14 @@
   "main": "build/index.js",
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "esbuild src/index.ts --platform=node --format=esm --outdir=build --sourcemap",
     "start": "node build/index.js",
     "dev": "node --import tsx src/index.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.7.1",
-    "dotenv": "^16.4.7",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "bottleneck": "^2.19.5",
+    "dotenv": "^16.4.7",
     "jsonwebtoken": "^9.0.2",
     "pipedrive": "^22.10.1",
     "ts-node": "^10.9.2",
@@ -21,6 +21,7 @@
   "devDependencies": {
     "@types/jsonwebtoken": "^9.0.6",
     "@types/node": "^20.10.5",
+    "esbuild": "^0.28.0",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"
   },

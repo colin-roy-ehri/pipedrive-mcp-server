@@ -1,0 +1,40 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/pipedrive-mcp-server:latest'
+      - '.'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/pipedrive-mcp-server:latest'
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'pipedrive-mcp-server'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/pipedrive-mcp-server:latest'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--port'
+      - '8080'
+      - '--timeout'
+      - '300'
+      - '--set-env-vars'
+      - 'MCP_TRANSPORT=http,PIPEDRIVE_DOMAIN=bytecodeio.pipedrive.com,GOOGLE_OAUTH_CLIENT_ID=824574286712-nd9tdkcn8b8ofq2ug8ig6srps26vt8j7.apps.googleusercontent.com'
+      - '--allow-unauthenticated'
+      - '--set-secrets'
+      - 'PIPEDRIVE_API_TOKEN=pipedrive_api_token:latest'
+
+substitutions:
+  _REGION: us-central1
+
+images:
+  - 'gcr.io/$PROJECT_ID/pipedrive-mcp-server'

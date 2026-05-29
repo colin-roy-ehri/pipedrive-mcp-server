@@ -10,12 +10,17 @@ services:
       - PIPEDRIVE_API_TOKEN=${PIPEDRIVE_API_TOKEN}
       - PIPEDRIVE_DOMAIN=${PIPEDRIVE_DOMAIN}
 
-      # Optional: JWT authentication
+      # Optional: JWT authentication (takes priority over Google OAuth if set)
       - MCP_JWT_SECRET=${MCP_JWT_SECRET:-}
       - MCP_JWT_TOKEN=${MCP_JWT_TOKEN:-}
       - MCP_JWT_ALGORITHM=${MCP_JWT_ALGORITHM:-HS256}
       - MCP_JWT_AUDIENCE=${MCP_JWT_AUDIENCE:-}
       - MCP_JWT_ISSUER=${MCP_JWT_ISSUER:-}
+
+      # Optional: Google OAuth authentication (used when MCP_JWT_SECRET is not set)
+      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID:-}
+      # Set to 'false' to skip Pipedrive user email validation (not recommended for production)
+      - PIPEDRIVE_VALIDATE_USER_EMAIL=${PIPEDRIVE_VALIDATE_USER_EMAIL:-true}
 
       # Optional: Rate limiting configuration
       - PIPEDRIVE_RATE_LIMIT_MIN_TIME_MS=${PIPEDRIVE_RATE_LIMIT_MIN_TIME_MS:-250}

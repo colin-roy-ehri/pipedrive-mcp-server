@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import * as pipedrive from "pipedrive";
 import * as dotenv from 'dotenv';
@@ -51,7 +52,14 @@ const jwtVerifyOptions = {
   issuer: process.env.MCP_JWT_ISSUER,
 };
 
+// Google OAuth configuration
+const googleOAuthClientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+const validateUserEmail = process.env.PIPEDRIVE_VALIDATE_USER_EMAIL !== 'false';
+const skipEmailVerification = process.env.MCP_SKIP_EMAIL_VERIFICATION === 'true';
+const skipPipedriveUserCheck = process.env.MCP_SKIP_PIPEDRIVE_USER_CHECK === 'true';
+
 if (jwtSecret) {
+  console.error("[INIT] JWT authentication enabled");
   const bootToken = process.env.MCP_JWT_TOKEN;
   if (!bootToken) {
     console.error("ERROR: MCP_JWT_TOKEN environment variable is required when MCP_JWT_SECRET is set");
@@ -60,33 +68,163 @@ if (jwtSecret) {
 
   try {
     jwt.verify(bootToken, jwtSecret, jwtVerifyOptions);
+    console.error("[INIT] Boot token verified successfully");
   } catch (error) {
     console.error("ERROR: Failed to verify MCP_JWT_TOKEN", error);
     process.exit(1);
   }
+} else if (googleOAuthClientId) {
+  console.error(`[INIT] Google OAuth authentication enabled (client_id=${googleOAuthClientId})`);
+  if (skipEmailVerification) {
+    console.error(`[INIT] WARNING: Email verification is DISABLED (MCP_SKIP_EMAIL_VERIFICATION=true)`);
+  }
+  if (skipPipedriveUserCheck) {
+    console.error(`[INIT] WARNING: Pipedrive user check is DISABLED (MCP_SKIP_PIPEDRIVE_USER_CHECK=true)`);
+  }
+} else {
+  console.error("[INIT] No authentication configured - all requests allowed");
 }
 
-const verifyRequestAuthentication = (req: http.IncomingMessage) => {
-  if (!jwtSecret) {
-    return { ok: true } as const;
-  }
+let pipedriveUserEmails: Set<string> | null = null;
 
-  const header = req.headers['authorization'];
-  if (!header) {
-    return { ok: false, status: 401, message: 'Missing Authorization header' } as const;
-  }
-
-  const [scheme, token] = header.split(' ');
-  if (scheme !== 'Bearer' || !token) {
-    return { ok: false, status: 401, message: 'Invalid Authorization header format' } as const;
-  }
-
+async function initializePipedriveUserCache(): Promise<void> {
+  if (pipedriveUserEmails !== null) return;
   try {
-    jwt.verify(token, jwtSecret, jwtVerifyOptions);
-    return { ok: true } as const;
-  } catch (error) {
-    return { ok: false, status: 401, message: 'Invalid or expired token' } as const;
+    const res = await fetch(
+      `https://${process.env.PIPEDRIVE_DOMAIN}/api/v1/users?api_token=${process.env.PIPEDRIVE_API_TOKEN}`,
+      { signal: AbortSignal.timeout(10000) }
+    );
+    if (!res.ok) throw new Error(`Pipedrive API error: ${res.status}`);
+    const body = await res.json() as { success: boolean; data?: Array<{ email: string; active_flag?: boolean }> };
+    if (!body.success || !body.data) throw new Error('Invalid response from Pipedrive users endpoint');
+    const active = body.data.filter(u => u.active_flag !== false);
+    pipedriveUserEmails = new Set(active.map(u => u.email.toLowerCase()));
+    console.error(`Pipedrive users cache initialized: ${pipedriveUserEmails.size} active users`);
+  } catch (err) {
+    console.error('Failed to initialize Pipedrive users cache:', err);
+    throw err;
   }
+}
+
+async function validateGoogleAccessToken(token: string): Promise<{ valid: boolean; email?: string; error?: string }> {
+  try {
+    console.error(`[GOOGLE_OAUTH] Validating token with Google`);
+    const res = await fetch(
+      `https://www.googleapis.com/oauth2/v1/tokeninfo?access_token=${encodeURIComponent(token)}`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    console.error(`[GOOGLE_OAUTH] Response status: ${res.status}`);
+
+    if (!res.ok) {
+      const errorText = await res.text();
+      console.error(`[GOOGLE_OAUTH] Token validation failed: ${res.status} - ${errorText}`);
+      return { valid: false, error: `Token validation failed: ${res.status}` };
+    }
+    const data = await res.json() as {
+      issued_to?: string;
+      user_id?: string;
+      email?: string;
+      email_verified?: string;
+    };
+    console.error(`[GOOGLE_OAUTH] Token info: issued_to=${data.issued_to}, email=${data.email}, email_verified=${data.email_verified}`);
+
+    if (googleOAuthClientId && data.issued_to !== googleOAuthClientId) {
+      console.error(`[GOOGLE_OAUTH] Audience mismatch: expected="${googleOAuthClientId}", got="${data.issued_to}"`);
+      return { valid: false, error: 'Invalid audience' };
+    }
+    if (data.email) {
+      if (!skipEmailVerification && data.email_verified !== 'true') {
+        console.error(`[GOOGLE_OAUTH] Email not verified: ${data.email} (email_verified="${data.email_verified}")`);
+        return { valid: false, error: 'Email not verified' };
+      }
+      if (skipEmailVerification && data.email_verified !== 'true') {
+        console.error(`[GOOGLE_OAUTH] Email verification skipped for: ${data.email} (email_verified="${data.email_verified}")`);
+      }
+      console.error(`[GOOGLE_OAUTH] Token valid for email: ${data.email}`);
+      return { valid: true, email: data.email };
+    }
+    // Service account token (no email)
+    console.error(`[GOOGLE_OAUTH] Service account token (no email)`);
+    return { valid: true };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[GOOGLE_OAUTH] Exception during validation: ${errMsg}`);
+    return { valid: false, error: errMsg };
+  }
+}
+
+const verifyRequestAuthentication = async (req: http.IncomingMessage): Promise<{ ok: true } | { ok: false; status: number; message: string }> => {
+  const header = req.headers['authorization'];
+  const requestPath = req.url || '/';
+  const requestMethod = req.method || 'UNKNOWN';
+
+  // JWT auth (takes priority if configured)
+  if (jwtSecret) {
+    console.error(`[AUTH] JWT auth enabled for ${requestMethod} ${requestPath}`);
+    if (!header) {
+      console.error(`[AUTH] JWT: Missing Authorization header`);
+      return { ok: false, status: 401, message: 'Missing Authorization header' };
+    }
+    const [scheme, token] = header.split(' ');
+    console.error(`[AUTH] JWT: Header present - scheme="${scheme}", token_present=${!!token}`);
+
+    if (scheme !== 'Bearer' || !token) {
+      console.error(`[AUTH] JWT: Invalid header format - scheme="${scheme}", token_present=${!!token}`);
+      return { ok: false, status: 401, message: 'Invalid Authorization header format' };
+    }
+    try {
+      jwt.verify(token, jwtSecret, jwtVerifyOptions);
+      console.error(`[AUTH] JWT: Token verified successfully`);
+      return { ok: true };
+    } catch (err) {
+      console.error(`[AUTH] JWT: Token verification failed - ${err instanceof Error ? err.message : String(err)}`);
+      return { ok: false, status: 401, message: 'Invalid or expired token' };
+    }
+  }
+
+  // Google OAuth auth
+  if (googleOAuthClientId) {
+    console.error(`[AUTH] Google OAuth auth enabled for ${requestMethod} ${requestPath}`);
+    if (!header) {
+      console.error(`[AUTH] Google OAuth: Missing Authorization header`);
+      return { ok: false, status: 401, message: 'Missing Authorization header' };
+    }
+    const [scheme, token] = header.split(' ');
+    console.error(`[AUTH] Google OAuth: Header present - scheme="${scheme}", token_present=${!!token}`);
+
+    if (scheme !== 'Bearer' || !token) {
+      console.error(`[AUTH] Google OAuth: Invalid header format - scheme="${scheme}", token_present=${!!token}`);
+      return { ok: false, status: 401, message: 'Invalid Authorization header format' };
+    }
+    const result = await validateGoogleAccessToken(token);
+    if (!result.valid) {
+      console.error(`[AUTH] Google OAuth: Token validation failed - ${result.error}`);
+      return { ok: false, status: 401, message: result.error ?? 'Invalid token' };
+    }
+    console.error(`[AUTH] Google OAuth: Token validated. Email=${result.email}, validateUserEmail=${validateUserEmail}`);
+
+    if (validateUserEmail) {
+      if (!result.email) {
+        console.error(`[AUTH] Google OAuth: Token has no verified email`);
+        return { ok: false, status: 403, message: 'Token has no verified email; user not authorized' };
+      }
+      if (!skipPipedriveUserCheck && (pipedriveUserEmails === null || !pipedriveUserEmails.has(result.email.toLowerCase()))) {
+        const cacheSize = pipedriveUserEmails?.size ?? 0;
+        console.error(`[AUTH] Google OAuth: User email not in Pipedrive cache - email="${result.email}", cache_size=${cacheSize}`);
+        return { ok: false, status: 403, message: 'User not authorized' };
+      }
+      if (skipPipedriveUserCheck) {
+        const cacheSize = pipedriveUserEmails?.size ?? 0;
+        console.error(`[AUTH] Google OAuth: Pipedrive user check skipped for: ${result.email} (cache_size=${cacheSize})`);
+      }
+    }
+    console.error(`[AUTH] Google OAuth: Authorization successful for ${result.email}`);
+    return { ok: true };
+  }
+
+  // No auth configured — allow all (dev/local mode)
+  console.error(`[AUTH] No auth configured - allowing all requests for ${requestMethod} ${requestPath}`);
+  return { ok: true };
 };
 
 const limiter = new Bottleneck({
@@ -134,12 +272,7 @@ const usersApi = withRateLimit(new pipedrive.UsersApi(apiClient));
 // Create MCP server
 const server = new McpServer({
   name: "pipedrive-mcp-server",
-  version: "1.0.2",
-  capabilities: {
-    resources: {},
-    tools: {},
-    prompts: {}
-  }
+  version: "1.0.2"
 });
 
 // === TOOLS ===
@@ -183,20 +316,22 @@ server.tool(
 );
 
 // Get deals with flexible filtering options
+const getDealsParams = {
+  searchTitle: z.string().optional().describe("Search deals by title/name (partial matches supported)"),
+  daysBack: z.number().optional().describe("Number of days back to fetch deals based on last activity date (default: 365)"),
+  ownerId: z.number().optional().describe("Filter deals by owner/user ID (use get-users tool to find IDs)"),
+  stageId: z.number().optional().describe("Filter deals by stage ID"),
+  status: z.string().optional().describe("Filter deals by status (default: open)"),
+  pipelineId: z.number().optional().describe("Filter deals by pipeline ID"),
+  minValue: z.number().optional().describe("Minimum deal value filter"),
+  maxValue: z.number().optional().describe("Maximum deal value filter"),
+  limit: z.number().optional().describe("Maximum number of deals to return (default: 500)")
+};
+
 server.tool(
   "get-deals",
   "Get deals from Pipedrive with flexible filtering options including search by title, date range, owner, stage, status, and more. Use 'get-users' tool first to find owner IDs.",
-  {
-    searchTitle: z.string().optional().describe("Search deals by title/name (partial matches supported)"),
-    daysBack: z.number().optional().describe("Number of days back to fetch deals based on last activity date (default: 365)"),
-    ownerId: z.number().optional().describe("Filter deals by owner/user ID (use get-users tool to find IDs)"),
-    stageId: z.number().optional().describe("Filter deals by stage ID"),
-    status: z.enum(['open', 'won', 'lost', 'deleted']).optional().describe("Filter deals by status (default: open)"),
-    pipelineId: z.number().optional().describe("Filter deals by pipeline ID"),
-    minValue: z.number().optional().describe("Minimum deal value filter"),
-    maxValue: z.number().optional().describe("Maximum deal value filter"),
-    limit: z.number().optional().describe("Maximum number of deals to return (default: 500)")
-  },
+  getDealsParams,
   async ({
     searchTitle,
     daysBack = 365,
@@ -797,13 +932,15 @@ server.tool(
 );
 
 // Generic search across item types
+const searchAllParams = {
+  term: z.string().describe("Search term"),
+  itemTypes: z.string().optional().describe("Comma-separated list of item types to search (deal,person,organization,product,file,activity,lead)")
+};
+
 server.tool(
   "search-all",
   "Search across all item types (deals, persons, organizations, etc.)",
-  {
-    term: z.string().describe("Search term"),
-    itemTypes: z.string().optional().describe("Comma-separated list of item types to search (deal,person,organization,product,file,activity,lead)")
-  },
+  searchAllParams,
   async ({ term, itemTypes }) => {
     try {
       const itemType = itemTypes; // Just rename the parameter
@@ -965,7 +1102,8 @@ const transportType = process.env.MCP_TRANSPORT || 'stdio';
 
 if (transportType === 'sse') {
   // SSE transport - create HTTP server
-  const port = parseInt(process.env.MCP_PORT || '3000', 10);
+  // PORT is injected by Cloud Run; fall back to MCP_PORT for local/Docker
+  const port = parseInt(process.env.PORT || process.env.MCP_PORT || '3000', 10);
   const endpoint = process.env.MCP_ENDPOINT || '/message';
 
   // Store active transports by session ID
@@ -986,7 +1124,7 @@ if (transportType === 'sse') {
     }
 
     if (req.method === 'GET' && url.pathname === '/sse') {
-      const authResult = verifyRequestAuthentication(req);
+      const authResult = await verifyRequestAuthentication(req);
       if (!authResult.ok) {
         res.writeHead(authResult.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: authResult.message }));
@@ -1013,7 +1151,7 @@ if (transportType === 'sse') {
         transports.delete(transport.sessionId);
       }
     } else if (req.method === 'POST' && url.pathname === endpoint) {
-      const authResult = verifyRequestAuthentication(req);
+      const authResult = await verifyRequestAuthentication(req);
       if (!authResult.ok) {
         res.writeHead(authResult.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: authResult.message }));
@@ -1070,6 +1208,99 @@ if (transportType === 'sse') {
     console.error(`Pipedrive MCP Server (SSE) listening on port ${port}`);
     console.error(`SSE endpoint: http://localhost:${port}/sse`);
     console.error(`Message endpoint: http://localhost:${port}${endpoint}`);
+
+    // Initialize Pipedrive user cache after server starts (if Google OAuth is enabled)
+    if (googleOAuthClientId) {
+      initializePipedriveUserCache().catch(err => {
+        console.error("Failed to initialize Pipedrive user cache:", err);
+      });
+    }
+  });
+} else if (transportType === 'http') {
+  // Streamable HTTP transport — required by Gemini Enterprise and modern MCP clients
+  const port = parseInt(process.env.PORT || process.env.MCP_PORT || '3000', 10);
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined, // stateless — works across Cloud Run instances
+    enableDnsRebindingProtection: false,
+  });
+
+  await server.connect(transport);
+
+  const httpServer = http.createServer(async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', transport: 'http' }));
+      return;
+    }
+
+    // MCP endpoint — handles POST (requests), GET (SSE stream), DELETE (session end)
+    if (req.url === '/' || req.url?.startsWith('/?')) {
+      const authResult = await verifyRequestAuthentication(req);
+      if (!authResult.ok) {
+        res.writeHead(authResult.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: authResult.message }));
+        return;
+      }
+
+      let body: unknown;
+      if (req.method === 'POST' && req.headers['content-type']?.includes('application/json')) {
+        try {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk as Buffer);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          body = raw ? JSON.parse(raw) : undefined;
+        } catch (err) {
+          console.error('[MCP] JSON parse error:', err instanceof Error ? err.message : String(err));
+          res.writeHead(400).end('Bad Request: Invalid JSON');
+          return;
+        }
+      }
+
+      try {
+        console.error(`[MCP] Handling ${req.method} request to ${req.url}`);
+        await transport.handleRequest(req, res, body);
+        console.error(`[MCP] Request completed successfully`);
+      } catch (err) {
+        console.error('[MCP] Error handling MCP request:', {
+          message: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack : undefined,
+          type: typeof err
+        });
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Internal Server Error' }));
+        }
+      }
+      return;
+    }
+
+    res.writeHead(404).end('Not found');
+  });
+
+  httpServer.listen(port, () => {
+    console.error(`Pipedrive MCP Server (HTTP) listening on port ${port}`);
+    console.error(`MCP endpoint: http://localhost:${port}/`);
+    console.error(`Health: http://localhost:${port}/health`);
+
+    // Initialize Pipedrive user cache after server starts (if Google OAuth is enabled)
+    if (googleOAuthClientId) {
+      initializePipedriveUserCache().catch(err => {
+        console.error("Failed to initialize Pipedrive user cache:", err);
+      });
+    }
   });
 } else {
   // Default: stdio transport

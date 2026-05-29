@@ -37,9 +37,10 @@ COPY --from=builder /app/build ./build
 
 # Set NODE_ENV to production
 ENV NODE_ENV=production
+# Default port — Cloud Run overrides this with its own PORT env var
+ENV MCP_PORT=8080
 
-# Expose the default MCP port (can be overridden via environment variable)
-EXPOSE 3000
+EXPOSE 8080
 
 # Run as non-root user for security
 USER node
